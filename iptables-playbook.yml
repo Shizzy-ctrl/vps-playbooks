@@ -1,0 +1,245 @@
+---
+- name: Konfiguracja iptables - blokada wszystkiego poza SSH i WireGuard
+  hosts: all
+  become: yes
+  vars:
+    public_interface: ens3
+    wireguard_interface: wg0
+    ssh_port: 22
+    wireguard_port: 51820
+    docker_bridge: docker0
+    wireguard_subnet: "10.0.0.0/24"
+    
+  tasks:
+    - name: Instalacja iptables-persistent
+      apt:
+        name: iptables-persistent
+        state: present
+        update_cache: yes
+      when: ansible_os_family == "Debian"
+
+    - name: Backup existing iptables rules
+      shell: iptables-save > /root/iptables-backup-$(date +%Y%m%d-%H%M%S).rules
+      
+    - name: Set default policy for INPUT to ACCEPT (safety first)
+      iptables:
+        chain: INPUT
+        policy: ACCEPT
+
+    - name: Set default policy for FORWARD to ACCEPT (safety first)
+      iptables:
+        chain: FORWARD
+        policy: ACCEPT
+
+    - name: Set default policy for OUTPUT to ACCEPT
+      iptables:
+        chain: OUTPUT
+        policy: ACCEPT
+
+    - name: Flush existing iptables rules
+      iptables:
+        chain: "{{ item }}"
+        flush: yes
+      loop:
+        - INPUT
+        - FORWARD
+        - OUTPUT
+
+    - name: Flush NAT table
+      iptables:
+        table: nat
+        chain: POSTROUTING
+        flush: yes
+
+    - name: Allow loopback traffic
+      iptables:
+        chain: INPUT
+        in_interface: lo
+        jump: ACCEPT
+
+    - name: Allow established and related connections FIRST
+      iptables:
+        chain: INPUT
+        ctstate: ESTABLISHED,RELATED
+        jump: ACCEPT
+        action: insert
+        rule_num: 1
+
+    - name: Allow SSH on public interface (CRITICAL - before any DROP)
+      iptables:
+        chain: INPUT
+        in_interface: "{{ public_interface }}"
+        protocol: tcp
+        destination_port: "{{ ssh_port }}"
+        ctstate: NEW
+        jump: ACCEPT
+        action: insert
+        rule_num: 2
+
+    - name: Allow WireGuard on public interface
+      iptables:
+        chain: INPUT
+        in_interface: "{{ public_interface }}"
+        protocol: udp
+        destination_port: "{{ wireguard_port }}"
+        jump: ACCEPT
+
+    - name: Allow all traffic on WireGuard interface
+      iptables:
+        chain: INPUT
+        in_interface: "{{ wireguard_interface }}"
+        jump: ACCEPT
+
+    - name: Allow ICMP ping (optional but useful)
+      iptables:
+        chain: INPUT
+        protocol: icmp
+        icmp_type: 8
+        jump: ACCEPT
+
+    - name: Allow established/related on FORWARD
+      iptables:
+        chain: FORWARD
+        ctstate: ESTABLISHED,RELATED
+        jump: ACCEPT
+
+    - name: Allow forwarding from WireGuard to public interface (internet access)
+      iptables:
+        chain: FORWARD
+        in_interface: "{{ wireguard_interface }}"
+        out_interface: "{{ public_interface }}"
+        jump: ACCEPT
+
+    - name: Allow forwarding from Docker to public interface (Docker internet access)
+      iptables:
+        chain: FORWARD
+        in_interface: "{{ docker_bridge }}"
+        out_interface: "{{ public_interface }}"
+        jump: ACCEPT
+
+    - name: Allow forwarding from WireGuard to Docker
+      iptables:
+        chain: FORWARD
+        in_interface: "{{ wireguard_interface }}"
+        out_interface: "{{ docker_bridge }}"
+        jump: ACCEPT
+
+    - name: Allow forwarding from Docker to WireGuard
+      iptables:
+        chain: FORWARD
+        in_interface: "{{ docker_bridge }}"
+        out_interface: "{{ wireguard_interface }}"
+        jump: ACCEPT
+
+    - name: Block forwarding from public interface to Docker (NO ACCESS FROM INTERNET)
+      iptables:
+        chain: FORWARD
+        in_interface: "{{ public_interface }}"
+        out_interface: "{{ docker_bridge }}"
+        jump: DROP
+
+    - name: NAT/Masquerade for WireGuard traffic going out to internet
+      iptables:
+        table: nat
+        chain: POSTROUTING
+        out_interface: "{{ public_interface }}"
+        source: "{{ wireguard_subnet }}"
+        jump: MASQUERADE
+
+    - name: Create DOCKER-USER chain if not exists
+      shell: iptables -N DOCKER-USER 2>/dev/null || true
+      
+    - name: Flush DOCKER-USER chain
+      iptables:
+        chain: DOCKER-USER
+        flush: yes
+      ignore_errors: yes
+
+    - name: Block Docker from being accessible from public interface in DOCKER-USER
+      iptables:
+        chain: DOCKER-USER
+        in_interface: "{{ public_interface }}"
+        jump: DROP
+      ignore_errors: yes
+
+    - name: Allow Docker through WireGuard in DOCKER-USER
+      iptables:
+        chain: DOCKER-USER
+        in_interface: "{{ wireguard_interface }}"
+        jump: RETURN
+      ignore_errors: yes
+
+    - name: Allow Docker outgoing traffic in DOCKER-USER
+      iptables:
+        chain: DOCKER-USER
+        out_interface: "{{ public_interface }}"
+        jump: RETURN
+      ignore_errors: yes
+
+    - name: Return from DOCKER-USER for other traffic
+      iptables:
+        chain: DOCKER-USER
+        jump: RETURN
+      ignore_errors: yes
+
+    - name: Drop all other INPUT traffic (last rule)
+      iptables:
+        chain: INPUT
+        jump: DROP
+        action: append
+
+    - name: Drop all other FORWARD traffic (last rule)
+      iptables:
+        chain: FORWARD
+        jump: DROP
+        action: append
+
+    - name: Enable IP forwarding
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        sysctl_set: yes
+        state: present
+        reload: yes
+
+    - name: Show current iptables rules
+      command: iptables -L -v -n --line-numbers
+      register: iptables_rules
+
+    - name: Show NAT rules
+      command: iptables -t nat -L -v -n --line-numbers
+      register: nat_rules
+
+    - name: Display rules
+      debug:
+        var: iptables_rules.stdout_lines
+
+    - name: Display NAT rules
+      debug:
+        var: nat_rules.stdout_lines
+
+    - name: Wait 5 seconds - verify SSH still works
+      pause:
+        seconds: 5
+        prompt: "Waiting 5 seconds - verify your SSH connection still works"
+
+    - name: Save iptables rules (Debian/Ubuntu)
+      shell: iptables-save > /etc/iptables/rules.v4
+      when: ansible_os_family == "Debian"
+
+    - name: Configure Docker daemon.json
+      copy:
+        content: |
+          {
+            "iptables": true,
+            "ip-forward": true
+          }
+        dest: /etc/docker/daemon.json
+        mode: '0644'
+      notify: restart docker
+
+  handlers:
+    - name: restart docker
+      service:
+        name: docker
+        state: restarted

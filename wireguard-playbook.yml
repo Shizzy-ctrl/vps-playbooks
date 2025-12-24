@@ -1,0 +1,280 @@
+---
+- name: Instalacja i konfiguracja WireGuard
+  hosts: ovh_vps
+  become: yes
+  vars:
+    wg_interface: wg0
+    wg_port: 51820
+    server_ip: 10.0.0.1/24
+    wg_dir: /etc/wireguard
+    keys_dir: "{{ wg_dir }}/keys"
+    
+    # Definicja klientów - dodaj/usuń według potrzeb
+    wireguard_clients:
+      - name: laptop
+        ip: 10.0.0.2/32
+    
+  tasks:
+    - name: Instalacja WireGuard
+      apt:
+        name: wireguard
+        state: present
+        update_cache: yes
+      when: ansible_os_family == "Debian"
+    
+    - name: Instalacja WireGuard (RedHat/CentOS)
+      yum:
+        name: wireguard-tools
+        state: present
+      when: ansible_os_family == "RedHat"
+    
+    - name: Utworzenie katalogu WireGuard
+      file:
+        path: "{{ wg_dir }}"
+        state: directory
+        mode: '0700'
+    
+    - name: Utworzenie katalogu na klucze
+      file:
+        path: "{{ keys_dir }}"
+        state: directory
+        mode: '0700'
+    
+    # === SERWER ===
+    
+    - name: Sprawdź czy klucz prywatny serwera istnieje
+      stat:
+        path: "{{ keys_dir }}/server_private.key"
+      register: server_private_key_file
+    
+    - name: Generowanie klucza prywatnego serwera
+      shell: wg genkey > {{ keys_dir }}/server_private.key
+      when: not server_private_key_file.stat.exists
+    
+    - name: Odczytaj klucz prywatny serwera
+      slurp:
+        src: "{{ keys_dir }}/server_private.key"
+      register: server_private_key_content
+    
+    - name: Ustaw zmienną klucza prywatnego serwera
+      set_fact:
+        server_private_key: "{{ server_private_key_content.content | b64decode | trim }}"
+    
+    - name: Sprawdź czy klucz publiczny serwera istnieje
+      stat:
+        path: "{{ keys_dir }}/server_public.key"
+      register: server_public_key_file
+    
+    - name: Generowanie klucza publicznego serwera
+      shell: echo "{{ server_private_key }}" | wg pubkey > {{ keys_dir }}/server_public.key
+      when: not server_public_key_file.stat.exists
+    
+    - name: Odczytaj klucz publiczny serwera
+      slurp:
+        src: "{{ keys_dir }}/server_public.key"
+      register: server_public_key_content
+    
+    - name: Ustaw zmienną klucza publicznego serwera
+      set_fact:
+        server_public_key: "{{ server_public_key_content.content | b64decode | trim }}"
+    
+    # === KLIENCI ===
+    
+    - name: Znajdź wszystkie istniejące klucze klientów
+      find:
+        paths: "{{ keys_dir }}"
+        patterns: "client_*_private.key"
+      register: existing_client_keys
+    
+    - name: Wyodrębnij nazwy istniejących klientów
+      set_fact:
+        existing_clients: "{{ existing_client_keys.files | map(attribute='path') | map('basename') | map('regex_replace', '^client_(.*)_private\\.key$', '\\1') | list }}"
+    
+    - name: Wyodrębnij nazwy zdefiniowanych klientów
+      set_fact:
+        defined_clients: "{{ wireguard_clients | map(attribute='name') | list }}"
+    
+    - name: Znajdź klientów do usunięcia
+      set_fact:
+        clients_to_remove: "{{ existing_clients | difference(defined_clients) }}"
+    
+    - name: Usuń klucze nieużywanych klientów
+      file:
+        path: "{{ keys_dir }}/client_{{ item[0] }}_{{ item[1] }}.key"
+        state: absent
+      loop: "{{ clients_to_remove | product(['private', 'public']) | list }}"
+      loop_control:
+        label: "{{ item[0] }}_{{ item[1] }}"
+      when: clients_to_remove | length > 0
+    
+    - name: Usuń konfiguracje nieużywanych klientów
+      file:
+        path: "{{ wg_dir }}/client_{{ item }}.conf"
+        state: absent
+      loop: "{{ clients_to_remove }}"
+      when: clients_to_remove | length > 0
+    
+    - name: Sprawdź czy klucze prywatne klientów istnieją
+      stat:
+        path: "{{ keys_dir }}/client_{{ item.name }}_private.key"
+      register: client_private_keys_check
+      loop: "{{ wireguard_clients }}"
+      loop_control:
+        label: "{{ item.name }}"
+    
+    - name: Generowanie kluczy prywatnych klientów
+      shell: wg genkey > {{ keys_dir }}/client_{{ item.item.name }}_private.key
+      when: not item.stat.exists
+      loop: "{{ client_private_keys_check.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+    
+    - name: Odczytaj klucze prywatne klientów
+      slurp:
+        src: "{{ keys_dir }}/client_{{ item.name }}_private.key"
+      register: client_private_keys
+      loop: "{{ wireguard_clients }}"
+      loop_control:
+        label: "{{ item.name }}"
+    
+    - name: Sprawdź czy klucze publiczne klientów istnieją
+      stat:
+        path: "{{ keys_dir }}/client_{{ item.name }}_public.key"
+      register: client_public_keys_check
+      loop: "{{ wireguard_clients }}"
+      loop_control:
+        label: "{{ item.name }}"
+    
+    - name: Generowanie kluczy publicznych klientów
+      shell: |
+        cat {{ keys_dir }}/client_{{ item.item.name }}_private.key | wg pubkey > {{ keys_dir }}/client_{{ item.item.name }}_public.key
+      when: not item.stat.exists
+      loop: "{{ client_public_keys_check.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+    
+    - name: Odczytaj klucze publiczne klientów
+      slurp:
+        src: "{{ keys_dir }}/client_{{ item.name }}_public.key"
+      register: client_public_keys
+      loop: "{{ wireguard_clients }}"
+      loop_control:
+        label: "{{ item.name }}"
+    
+    - name: Przygotuj dane klientów
+      set_fact:
+        clients_data: "{{ clients_data | default([]) + [{'name': item.0.name, 'ip': item.0.ip, 'private_key': item.1.content | b64decode | trim, 'public_key': item.2.content | b64decode | trim}] }}"
+      loop: "{{ wireguard_clients | zip(client_private_keys.results, client_public_keys.results) | list }}"
+      loop_control:
+        label: "{{ item.0.name }}"
+    
+    # === KONFIGURACJA SERWERA ===
+    
+    - name: Utworzenie konfiguracji serwera WireGuard
+      template:
+        src: wg0-server.conf.j2
+        dest: "{{ wg_dir }}/{{ wg_interface }}.conf"
+        mode: '0600'
+      register: server_config
+    
+    - name: Włączenie IP forwarding
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        sysctl_set: yes
+        state: present
+        reload: yes
+    
+    - name: Sprawdź czy WireGuard jest uruchomiony
+      systemd:
+        name: "wg-quick@{{ wg_interface }}"
+      register: wg_service_status
+      ignore_errors: yes
+    
+    - name: Restart WireGuard jeśli konfiguracja się zmieniła
+      systemd:
+        name: "wg-quick@{{ wg_interface }}"
+        state: restarted
+      when: server_config.changed and wg_service_status.status.ActiveState == "active"
+    
+    - name: Włączenie i uruchomienie WireGuard
+      systemd:
+        name: "wg-quick@{{ wg_interface }}"
+        enabled: yes
+        state: started
+      when: wg_service_status.status.ActiveState != "active"
+    
+    # === KONFIGURACJE KLIENTÓW ===
+    
+    - name: Utworzenie konfiguracji dla klientów
+      template:
+        src: client.conf.j2
+        dest: "{{ wg_dir }}/client_{{ item.name }}.conf"
+        mode: '0600'
+      loop: "{{ clients_data }}"
+      loop_control:
+        label: "{{ item.name }}"
+    
+    - name: Odczytaj konfiguracje klientów
+      slurp:
+        src: "{{ wg_dir }}/client_{{ item.name }}.conf"
+      register: client_configs
+      loop: "{{ clients_data }}"
+      loop_control:
+        label: "{{ item.name }}"
+    
+    - name: Zapisz konfiguracje klientów lokalnie
+      local_action:
+        module: copy
+        content: "{{ item.content | b64decode }}"
+        dest: "./client_{{ item.item.name }}_wg0.conf"
+      become: no
+      loop: "{{ client_configs.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+    
+    # === OUTPUT ===
+    
+    - name: "=== KONFIGURACJE KLIENTÓW - GOTOWE DO WKLEJENIA ==="
+      debug:
+        msg: |
+          
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║  KLIENT: {{ item.name | upper }}
+          ║  Zapisano w: ./client_{{ item.name }}_wg0.conf
+          ╚══════════════════════════════════════════════════════════════════╝
+          
+          [Interface]
+          Address = {{ item.ip }}
+          PrivateKey = {{ item.private_key }}
+          DNS = 1.1.1.1
+          
+          [Peer]
+          PublicKey = {{ server_public_key }}
+          Endpoint = {{ ansible_default_ipv4.address }}:{{ wg_port }}
+          AllowedIPs = 0.0.0.0/0
+          PersistentKeepalive = 25
+          
+          ────────────────────────────────────────────────────────────────────
+      loop: "{{ clients_data }}"
+      loop_control:
+        label: "{{ item.name }}"
+    
+    - name: "=== PODSUMOWANIE ==="
+      debug:
+        msg:
+          - "╔══════════════════════════════════════════════════════════════════╗"
+          - "║                         PODSUMOWANIE                             ║"
+          - "╚══════════════════════════════════════════════════════════════════╝"
+          - ""
+          - "Serwer WireGuard: {{ ansible_default_ipv4.address }}:{{ wg_port }}"
+          - "Sieć VPN: {{ server_ip }}"
+          - "Liczba klientów: {{ wireguard_clients | length }}"
+          - ""
+          - "Klienci:"
+          - "{% for client in clients_data %}  - {{ client.name }}: {{ client.ip }}{% endfor %}"
+          - ""
+          - "{% if clients_to_remove | length > 0 %}Usunięci klienci: {{ clients_to_remove | join(', ') }}{% endif %}"
+          - ""
+          - "Pliki konfiguracyjne zapisane lokalnie:"
+          - "{% for client in clients_data %}  - ./client_{{ client.name }}_wg0.conf{% endfor %}"

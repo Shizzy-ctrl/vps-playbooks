@@ -1,0 +1,14 @@
+[Interface]
+Address = {{ server_ip }}
+ListenPort = {{ wg_port }}
+PrivateKey = {{ server_private_key }}
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o {{ ansible_default_ipv4.interface }} -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o {{ ansible_default_ipv4.interface }} -j MASQUERADE
+
+{% for client in clients_data %}
+[Peer]
+# {{ client.name }}
+PublicKey = {{ client.public_key }}
+AllowedIPs = {{ client.ip }}
+
+{% endfor %}

@@ -1,0 +1,53 @@
+---
+- name: Blokada SSH na publicznym interfejsie - dostep tylko przez WireGuard
+  hosts: ovh_vps
+  become: yes
+  vars:
+    public_interface: ens3
+    wireguard_interface: wg0
+    ssh_port: 22
+    
+  tasks:
+    - name: Backup existing iptables rules
+      shell: iptables-save > /root/iptables-backup-ssh-block-$(date +%Y%m%d-%H%M%S).rules
+
+    - name: BLOCK SSH on public interface (ens3)
+      iptables:
+        chain: INPUT
+        in_interface: "{{ public_interface }}"
+        protocol: tcp
+        destination_port: "{{ ssh_port }}"
+        jump: DROP
+        action: insert
+        rule_num: 1
+
+    - name: Allow SSH ONLY on WireGuard interface
+      iptables:
+        chain: INPUT
+        in_interface: "{{ wireguard_interface }}"
+        protocol: tcp
+        destination_port: "{{ ssh_port }}"
+        jump: ACCEPT
+        action: insert
+        rule_num: 1
+
+    - name: Show current SSH related rules
+      shell: iptables -L INPUT -v -n --line-numbers | grep -E "ssh|{{ ssh_port }}"
+      register: ssh_rules
+      ignore_errors: yes
+
+    - name: Display SSH rules
+      debug:
+        var: ssh_rules.stdout_lines
+
+    - name: Save iptables rules (Debian/Ubuntu)
+      shell: iptables-save > /etc/iptables/rules.v4
+      when: ansible_os_family == "Debian"
+
+    - name: Final warning message
+      debug:
+        msg: |
+          ==========================================
+          UWAGA! SSH na {{ public_interface }} jest ZABLOKOWANE!
+          Dostep SSH tylko przez WireGuard!
+          ==========================================
