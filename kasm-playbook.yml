@@ -1,0 +1,155 @@
+---
+- name: Instalacja Kasm Workspaces z bindem do WireGuard IP
+  hosts: all
+  become: yes
+  vars:
+    wireguard_ip: "10.0.0.1"
+    kasm_version: "1.15.0"
+    kasm_build: "06fdc8"
+    swap_size: 8192
+    default_admin_password: "ChangeMeNow123!"
+    default_user_password: "ChangeMeNow456!"
+    
+  tasks:
+    - name: Instalacja wymaganych pakietów
+      apt:
+        name:
+          - wget
+          - tar
+          - curl
+        state: present
+        update_cache: yes
+
+    - name: Sprawdź czy Kasm już jest zainstalowany
+      stat:
+        path: /opt/kasm
+      register: kasm_installed
+
+    - name: Pobierz Kasm Workspaces
+      get_url:
+        url: "https://kasm-static-content.s3.amazonaws.com/kasm_release_{{ kasm_version }}.{{ kasm_build }}.tar.gz"
+        dest: "/tmp/kasm_release_{{ kasm_version }}.{{ kasm_build }}.tar.gz"
+        timeout: 300
+      when: not kasm_installed.stat.exists
+
+    - name: Rozpakuj Kasm Workspaces
+      unarchive:
+        src: "/tmp/kasm_release_{{ kasm_version }}.{{ kasm_build }}.tar.gz"
+        dest: /tmp
+        remote_src: yes
+      when: not kasm_installed.stat.exists
+
+    - name: Zainstaluj Kasm Workspaces (bez startowania)
+      shell: |
+        cd /tmp/kasm_release
+        bash kasm_release/install.sh \
+          --accept-eula \
+          --swap-size {{ swap_size }} \
+          --admin-password "{{ default_admin_password }}" \
+          --user-password "{{ default_user_password }}" \
+          --no-start
+      args:
+        creates: /opt/kasm/current
+      register: kasm_install
+      when: not kasm_installed.stat.exists
+
+    - name: Backup oryginalnego docker-compose.yaml
+      copy:
+        src: /opt/kasm/current/docker/docker-compose.yaml
+        dest: /opt/kasm/current/docker/docker-compose.yaml.backup
+        remote_src: yes
+        force: no
+
+    - name: Modyfikuj docker-compose - bind portów do WireGuard IP
+      replace:
+        path: /opt/kasm/current/docker/docker-compose.yaml
+        regexp: '- "{{ item }}:{{ item }}"'
+        replace: '- "{{ wireguard_ip }}:{{ item }}:{{ item }}"'
+      loop:
+        - 443
+        - 3389
+      register: compose_modified
+
+    - name: Modyfikuj api.app.config.yaml - ustaw hostname
+      lineinfile:
+        path: /opt/kasm/current/conf/app/api.app.config.yaml
+        regexp: '^(\s*)server_hostname:.*'
+        line: '\1server_hostname: {{ wireguard_ip }}'
+        backrefs: yes
+      when: kasm_installed.stat.exists or kasm_install.changed
+
+    - name: Modyfikuj api.app.config.yaml - ustaw address
+      lineinfile:
+        path: /opt/kasm/current/conf/app/api.app.config.yaml
+        regexp: '^(\s*)server_address:.*'
+        line: '\1server_address: {{ wireguard_ip }}'
+        backrefs: yes
+      when: kasm_installed.stat.exists or kasm_install.changed
+
+    - name: Stop Kasm jeśli działa
+      command: /opt/kasm/bin/stop
+      ignore_errors: yes
+      when: compose_modified.changed
+
+    - name: Start Kasm Workspaces
+      command: /opt/kasm/bin/start
+      register: kasm_start
+
+    - name: Poczekaj na uruchomienie usług (30 sekund)
+      pause:
+        seconds: 30
+
+    - name: Sprawdź status usług Kasm
+      command: docker ps --filter "name=kasm" --format "table {{.Names}}\t{{.Status}}"
+      register: kasm_status
+
+    - name: Sprawdź bindowanie portów
+      shell: ss -tlnp | grep -E ':(443|80|4902)' || netstat -tlnp | grep -E ':(443|80|4902)'
+      register: port_bindings
+      ignore_errors: yes
+
+    - name: Pobierz dane logowania z install.log
+      shell: grep -A 10 "Credentials" /opt/kasm/current/install.log || echo "Brak danych w install.log"
+      register: kasm_credentials
+      ignore_errors: yes
+
+    - name: Wyświetl informacje o instalacji
+      debug:
+        msg:
+          - "============================================"
+          - "Kasm Workspaces został zainstalowany!"
+          - "============================================"
+          - ""
+          - "URL: https://{{ wireguard_ip }}"
+          - ""
+          - "Domyślne hasła (ZMIEŃ JE!):"
+          - "  Admin password: {{ default_admin_password }}"
+          - "  User password: {{ default_user_password }}"
+          - ""
+          - "Status kontenerów:"
+          - "{{ kasm_status.stdout_lines }}"
+          - ""
+          - "Porty zbindowane:"
+          - "{{ port_bindings.stdout_lines }}"
+          - ""
+          - "Kasm jest dostępny TYLKO przez WireGuard ({{ wireguard_ip }})"
+          - ""
+          - "Użyteczne komendy:"
+          - "  Start:  sudo /opt/kasm/bin/start"
+          - "  Stop:   sudo /opt/kasm/bin/stop"
+          - "  Status: docker ps --filter name=kasm"
+          - "  Logs:   docker logs kasm_proxy"
+
+    - name: Wyświetl dane logowania z install.log
+      debug:
+        var: kasm_credentials.stdout_lines
+      when: kasm_credentials.stdout != ""
+
+    - name: Usuń pliki instalacyjne
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/kasm_release_{{ kasm_version }}.{{ kasm_build }}.tar.gz"
+        - /tmp/kasm_release
+      when: kasm_install.changed

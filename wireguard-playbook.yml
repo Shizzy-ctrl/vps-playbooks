@@ -13,6 +13,8 @@
     wireguard_clients:
       - name: laptop
         ip: 10.0.0.2/32
+      - name: iphone-pawel
+        ip: 10.0.0.3/32
     
   tasks:
     - name: Instalacja WireGuard
